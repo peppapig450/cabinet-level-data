@@ -47,33 +47,26 @@ def create_cabinet_csv(
             # Create flattened column names
             if isinstance(df.columns, pd.MultiIndex):
                 # Extract the position name from the first level
-                position = df.columns[0][0]
+                position = df.columns.get_level_values(0)[0]
 
-                # For each column tuple, prefer second level if it exists and isn't empty
-                new_cols = pd.Series(df.columns.to_list()).apply(
-                    lambda x: (
-                        x[1]
-                        if isinstance(x, tuple)
-                        and len(x) > 1
-                        and x[1]
-                        and str(x[1]).strip() != ""
-                        else (x[0] if isinstance(x, tuple) else x)
-                    )
+                level0 = df.columns.get_level_values(0)
+                level1 = (
+                    df.columns.get_level_values(1) if df.columns.nlevels > 1 else None
                 )
 
-                # Handle duplicate column names
-                col_counts = new_cols.value_counts().to_dict()
+                if level1 is not None:
+                    mask = level1.astype(str).str.strip() != ""
+                    new_cols = pd.Series(level1.where(mask, level0))
+                else:
+                    new_cols = pd.Series(level0)
 
-                # Only add suffix to duplicates
-                for col, count in col_counts.items():
-                    if count > 1:
-                        # Find all indices where this column name appears
+                if (duplicated := new_cols.duplicated(keep=False)).any():
+                    for col in new_cols[duplicated].unique():
                         indices = new_cols[new_cols == col].index
-                        # Add suffixes to all but the first occurrence
+
                         for suffix_idx, idx in enumerate(indices[1:], 1):
                             new_cols.iloc[idx] = f"{col}_{suffix_idx}"
 
-                # Assign the new column names to the dataframe
                 df.columns = new_cols
 
             # Drop unnamed columns
@@ -113,11 +106,11 @@ def create_cabinet_csv(
 
     # Process data part
     if "Date of birth" in final_df.columns:
-        # Extract just the date part (before the parantheses)
-        date_part = final_df["Date of birth"].str.extract(r"(.*?)\s*\(", expand=False)
-        date_part = date_part.fillna(final_df["Date of birth"])
+        dob_col = final_df["Date of birth"]
 
-        # Convert to datetime preserving the original string column
+        # Extract just the date part (before the parentheses)
+        date_part = dob_col.str.extract(r"(.*?)\s*\(", expand=False).fillna(dob_col)
+
         final_df["Birth Date"] = pd.to_datetime(date_part, errors="coerce")
 
         # Extract birth year as integer
@@ -127,19 +120,16 @@ def create_cabinet_csv(
         if final_df["Birth Year"].isna().any():
             # Fallback to regex extraction for problematic rows
             year_mask = final_df["Birth Year"].isna()
-            year_extracted = final_df.loc[year_mask, "Date of birth"].str.extract(
-                r"(\d{4})"
-            )
+
+            year_extracted = dob_col[year_mask].str.extract(r"(\d{4})", expand=False)
             final_df.loc[year_mask, "Birth Year"] = pd.to_numeric(
-                year_extracted[0], errors="coerce", downcast="unsigned"
+                year_extracted, errors="coerce", downcast="unsigned"
             )
 
         # Extract age
-        final_df["Age"] = final_df["Date of birth"].str.extract(
-            r"(?:age|Age|AGE)\s*(\d+)", expand=False
-        )
+        final_df["Age"] = dob_col.str.extract(r"(?:age|Age|AGE)\s*(\d+)", expand=False)
         final_df["Age"] = pd.to_numeric(
-            final_df["Age"], errors="coerce", downcast="unsigned"
+            final_df["Age"], errors="coerce", downcast="integer"
         )
 
     # Process 'Years' column if it exists
@@ -172,9 +162,9 @@ def create_cabinet_csv(
 
     # Drop redundant columns
     columns_to_drop = ["Reference", "Refs", "Notes"]
-    final_df = final_df.drop(
-        [col for col in columns_to_drop if col in final_df.columns], axis=1
-    )
+    cols_to_remove = final_df.columns.intersection(columns_to_drop)
+    if not cols_to_remove.empty:
+        final_df = final_df.drop(columns=cols_to_remove)
 
     # Reorder columns with key information first
     priority_cols = [
@@ -187,9 +177,13 @@ def create_cabinet_csv(
         "Birth Year",
         "Background",
     ]
-    available_priority = [col for col in priority_cols if col in final_df.columns]
-    remaining_cols = [col for col in final_df.columns if col not in priority_cols]
-    final_df = final_df[available_priority + remaining_cols]
+    available_priority = final_df.columns.intersection(priority_cols)
+    remaining_cols = final_df.columns.difference(priority_cols)
+    # Preserve priority order by reindexing available columns
+    available_priority_ordered = pd.Index(
+        [col for col in priority_cols if col in available_priority]
+    )
+    final_df = final_df[available_priority_ordered.append(remaining_cols)]
 
     # Convert datetime to ISO format when saving to CSV
     if "Birth Date" in final_df.columns:
@@ -199,6 +193,8 @@ def create_cabinet_csv(
     for col in ["Birth Year", "Start year", "End year"]:
         if col in final_df.columns and is_float_dtype(final_df[col]):
             final_df[col] = final_df[col].fillna(pd.NA).astype("Int64")
+
+    os.makedirs("data", exist_ok=True)
 
     # Save to CSV with proper handling of newlines in text fields
     final_df.to_csv(
@@ -211,7 +207,7 @@ def create_cabinet_csv(
 
 def combine_cabinets(csv_files, output_file="all_cabinets.csv"):
     """
-    Combine multiple cabinet CSV files into a single file.
+    Combine multiple cabinet CSV files into a single file using pandas.
 
     Args:
         csv_files (list): List of CSV files to combine
@@ -222,11 +218,21 @@ def combine_cabinets(csv_files, output_file="all_cabinets.csv"):
     """
     print(f"Combining {len(csv_files)} cabinet files...")
 
+    # Using a list comprehension with pd.read_csv and error handling
     dfs = []
     for file in csv_files:
         try:
-            df = pd.read_csv(f"data/{file}")
+            # Use pandas read_csv with appropriate options for consistency
+            df = pd.read_csv(
+                f"data/{file}",
+                na_values=["", "N/A"],
+                keep_default_na=True,
+                dtype_backend="numpy_nullable",  # Better handling of nullable integer types
+            )
             dfs.append(df)
+            print(
+                f"Successfully read {file} with {len(df)} rows and {len(df.columns)} columns"
+            )
         except Exception as e:
             print(f"Error reading {file}: {str(e)}")
 
@@ -234,12 +240,22 @@ def combine_cabinets(csv_files, output_file="all_cabinets.csv"):
         print("No CSV files were read successfully.")
         return pd.DataFrame()
 
-    combined_df = pd.concat(dfs, ignore_index=True)
+    combined_df = pd.concat(dfs, ignore_index=True, sort=False)
+
+    # Process the combined data for consistency
+    print(f"Combined data has {len(combined_df)} total rows")
+
+    # Ensure directory exists
+    os.makedirs("data", exist_ok=True)
 
     # Save the combined data
-    os.makedirs("data", exist_ok=True)
     combined_df.to_csv(
-        f"data/{output_file}", index=False, quoting=1, escapechar="\\", doublequote=True
+        f"data/{output_file}",
+        index=False,
+        quoting=1,  # Quote all strings
+        escapechar="\\",
+        doublequote=True,
+        na_rep="",  # Empty string for NA values
     )
     print(f"Combined CSV file saved to data/{output_file}")
 
@@ -247,23 +263,50 @@ def combine_cabinets(csv_files, output_file="all_cabinets.csv"):
 
 
 if __name__ == "__main__":
-    trump_second = create_cabinet_csv(
-        "https://en.wikipedia.org/wiki/Second_cabinet_of_Donald_Trump",
-        administration="Trump 2nd",
-        output_file="trump_second_cabinet.csv",
-    )
+    # Define cabinet sources with their metadata
+    cabinet_sources = [
+        {
+            "url": "https://en.wikipedia.org/wiki/Second_cabinet_of_Donald_Trump",
+            "administration": "Trump 2nd",
+            "output_file": "trump_second_cabinet.csv",
+        },
+        {
+            "url": "https://en.wikipedia.org/wiki/First_cabinet_of_Donald_Trump",
+            "administration": "Trump 1st",
+            "output_file": "trump_first_cabinet.csv",
+        },
+        {
+            "url": "https://en.wikipedia.org/wiki/Cabinet_of_Joe_Biden",
+            "administration": "Biden",
+            "output_file": "biden_cabinet.csv",
+        },
+    ]
 
-    trump_first = create_cabinet_csv(
-        "https://en.wikipedia.org/wiki/First_cabinet_of_Donald_Trump",
-        administration="Trump 1st",
-        output_file="trump_first_cabinet.csv",
-    )
+    # Process each cabinet using pandas
+    results = {}
+    csv_files = []
 
-    biden = create_cabinet_csv(
-        "https://en.wikipedia.org/wiki/Cabinet_of_Joe_Biden",
-        administration="Biden",
-        output_file="biden_cabinet.csv",
-    )
-    all_cabinets = combine_cabinets(
-        ["trump_first_cabinet.csv", "trump_second_cabinet.csv", "biden_cabinet.csv"]
+    # Create individual cabinet files
+    for cabinet in cabinet_sources:
+        print(f"\nProcessing {cabinet['administration']} cabinet...")
+        df = create_cabinet_csv(
+            url=cabinet["url"],
+            administration=cabinet["administration"],
+            output_file=cabinet["output_file"],
+        )
+        results[cabinet["administration"]] = df
+        csv_files.append(cabinet["output_file"])
+
+    # Display summary of individual results
+    print("\nSummary of cabinets processed:")
+    for admin, df in results.items():
+        print(f"{admin}: {len(df)} members")
+
+    # Combine all cabinets into a single file
+    print("\nCombining all cabinet data...")
+    all_cabinets = combine_cabinets(csv_files)
+
+    # Final summary
+    print(
+        f"\nAll cabinet data processing complete! Total of {len(all_cabinets)} cabinet members processed."
     )
