@@ -5,12 +5,15 @@ import pandas as pd
 from pandas.api.types import is_float_dtype, is_object_dtype
 
 
-def create_cabinet_csv(url: str, output_file: str | None = None) -> pd.DataFrame:
+def create_cabinet_csv(
+    url: str, administration: str, output_file: str | None = None
+) -> pd.DataFrame:
     """
     Create a CSV database of a presidential cabinet from a Wikipedia page using vectorized operations.
 
     Args:
         url (str): URL of the Wikipedia page
+        administration (str): Name of the administration (e.g., "Trump 1st", "Biden")
         output_file (str, optional): Path to save the CSV file. If None, will use a default name.
 
     Returns:
@@ -79,6 +82,8 @@ def create_cabinet_csv(url: str, output_file: str | None = None) -> pd.DataFrame
 
             # Add position column
             df["Position"] = position
+
+            df["Administration"] = administration
 
             if "Name" in df.columns:
                 # Filter out rows where Name is NA or equals 'Name' (header rows)
@@ -173,6 +178,7 @@ def create_cabinet_csv(url: str, output_file: str | None = None) -> pd.DataFrame
 
     # Reorder columns with key information first
     priority_cols = [
+        "Administration",
         "Position",
         "Name",
         "Age",
@@ -203,15 +209,61 @@ def create_cabinet_csv(url: str, output_file: str | None = None) -> pd.DataFrame
     return final_df
 
 
+def combine_cabinets(csv_files, output_file="all_cabinets.csv"):
+    """
+    Combine multiple cabinet CSV files into a single file.
+
+    Args:
+        csv_files (list): List of CSV files to combine
+        output_file (str): Name of the output file
+
+    Returns:
+        pandas.DataFrame: Combined cabinet data
+    """
+    print(f"Combining {len(csv_files)} cabinet files...")
+
+    dfs = []
+    for file in csv_files:
+        try:
+            df = pd.read_csv(f"data/{file}")
+            dfs.append(df)
+        except Exception as e:
+            print(f"Error reading {file}: {str(e)}")
+
+    if not dfs:
+        print("No CSV files were read successfully.")
+        return pd.DataFrame()
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+
+    # Save the combined data
+    os.makedirs("data", exist_ok=True)
+    combined_df.to_csv(
+        f"data/{output_file}", index=False, quoting=1, escapechar="\\", doublequote=True
+    )
+    print(f"Combined CSV file saved to data/{output_file}")
+
+    return combined_df
+
+
 if __name__ == "__main__":
-    create_cabinet_csv(
+    trump_second = create_cabinet_csv(
         "https://en.wikipedia.org/wiki/Second_cabinet_of_Donald_Trump",
-        "trump_second_cabinet.csv",
+        administration="Trump 2nd",
+        output_file="trump_second_cabinet.csv",
     )
-    create_cabinet_csv(
+
+    trump_first = create_cabinet_csv(
         "https://en.wikipedia.org/wiki/First_cabinet_of_Donald_Trump",
-        "trump_first_cabinet.csv",
+        administration="Trump 1st",
+        output_file="trump_first_cabinet.csv",
     )
-    create_cabinet_csv(
-        "https://en.wikipedia.org/wiki/Cabinet_of_Joe_Biden", "biden_cabinet.csv"
+
+    biden = create_cabinet_csv(
+        "https://en.wikipedia.org/wiki/Cabinet_of_Joe_Biden",
+        administration="Biden",
+        output_file="biden_cabinet.csv",
+    )
+    all_cabinets = combine_cabinets(
+        ["trump_first_cabinet.csv", "trump_second_cabinet.csv", "biden_cabinet.csv"]
     )
